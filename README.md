@@ -1,4 +1,5 @@
 # solid-CO2-thermodynamics
+
 Interactive Jupyter workflow to compute and visualize the free‐energy phase diagram of solid CO2
 
 This repository provides a fully documented, Jupyter‐driven workflow to compute the free‐energy phase diagram of CO₂ solid phases. The goal is to show how one can:
