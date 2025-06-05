@@ -15,38 +15,6 @@ This repository provides a fully documented, Jupyter‐driven workflow to comput
 
 ## Contents
 
-solid-CO2-thermodynamics/
-├── README.md
-├── LICENSE
-├── .gitignore
-├── notebooks/
-│   ├── 00_setup_environment.ipynb
-│   ├── 01_optimize_structures.ipynb
-│   ├── 02_phonon_calculations.ipynb
-│   ├── 03_free_energy_QHA.ipynb
-│   └── 04_phase_diagram_plot.ipynb
-├── scripts/
-│   ├── optimize_structure.py
-│   ├── phonon_run.py
-│   ├── compute_free_energy.py
-│   └── utils.py
-├── data/
-│   ├── raw_structures/         ← (e.g., CIF files for different phases/space groups)
-│   ├── optimized_structures/   ← (output from optimizations, maybe POSCARs or Crystals)
-│   ├── phonon_data/            ← (e.g., dynamical matrices/force constants)
-│   └── free_energies/          ← (QHA results at each pressure)
-├── docs/
-│   ├── INSTALL.md              ← (conda/pip/virtualenv instructions, dependencies)
-│   ├── USAGE.md                ← (how to run notebooks, run scripts, expected outputs)
-│   └── THEORY.md               ← (short summary: QHA, why BZ sampling matters, approximations)
-├── environment.yml             ← (Conda environment file, if you want reproducibility)
-├── requirements.txt            ← (Python dependencies if you prefer pip)
-└── tests/
-    ├── test_optimize.py
-    ├── test_phonon.py
-    └── test_free_energy.py
-
-
 - **[notebooks/](notebooks/)**  
   Interactive, step-by-step Jupyter notebooks for each major stage of the workflow.  
 - **[scripts/](scripts/)**  
