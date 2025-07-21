@@ -22,6 +22,101 @@ except ImportError:
     from co2_potential import p1b, sapt
     ANALYTICAL_AVAILABLE = False
 
+# Add this to visualize and debug the Hessian matrix
+import matplotlib.pyplot as plt
+import numpy as np
+
+def debug_hessian(hessian_data):
+    # Plot the Hessian matrix as a heatmap
+    print("Debugging Hessian matrix:")
+    h = hessian_data
+    plt.figure(figsize=(10, 10))
+    plt.imshow(h, cmap='RdBu', interpolation='nearest')
+    plt.colorbar()
+    plt.title('Hessian Matrix')
+    print("Hessian matrix shape:", h.shape)
+    # Check for symmetry
+    symmetry_diff = np.max(np.abs(h - h.T))
+    print(f"Hessian symmetry check: max(|H - H^T|) = {symmetry_diff}")
+    
+    # Check eigenvalues
+    eigvals = np.linalg.eigvalsh(h)
+    print(f"Number of zero/negative eigenvalues: {sum(eigvals < 1e-10)}")
+    print(f"Smallest eigenvalues: {eigvals[:6]}")
+    
+    # Check if acoustic sum rule is satisfied
+    n_atoms = h.shape[0] // 3
+    for i in range(3):  # For each direction x,y,z
+        for j in range(n_atoms):
+            row_sum = sum(h[3*j+i, 3*k:3*k+3] for k in range(n_atoms))
+            print(f"Sum rule check atom {j}, dir {i}: {np.sum(row_sum):.6f}")
+
+
+def enforce_asr_extended_hessian(extended_hessian, verbose=False):
+    """
+    Enforce Acoustic Sum Rule (ASR) explicitly on a dictionary-based extended Hessian.
+
+    Parameters:
+        extended_hessian (dict): 
+            Keys are tuples (ix, iy, iz) representing lattice cell indices.
+            Values are Hessian matrices (3n x 3n numpy arrays).
+            The key (0,0,0) is the central cell Hessian after neighbor subtraction.
+
+    Returns:
+        dict: ASR-corrected extended Hessian dictionary.
+    """
+
+    # Make a copy to avoid mutating original data
+    extended_hessian = {cell: hess.copy() for cell, hess in extended_hessian.items()}
+
+    central_key = (0, 0, 0)
+    central_hessian = extended_hessian[central_key]
+
+    n3 = central_hessian.shape[0]
+    natoms = n3 // 3
+
+    # Reshape central Hessian to (natoms, 3, natoms, 3)
+    central_hessian_rs = central_hessian.reshape(natoms, 3, natoms, 3)
+
+    # Initialize sum over neighbor cells
+    sum_neighbors = np.zeros_like(central_hessian_rs)
+
+    for shift, neighbor_hessian in extended_hessian.items():
+        if shift == central_key:
+            continue  # Skip central cell
+        neighbor_rs = neighbor_hessian.reshape(natoms, 3, natoms, 3)
+        sum_neighbors += neighbor_rs
+
+    # Enforce ASR explicitly on central Hessian
+    for j in range(natoms):
+        for a in range(3):
+            # Sum over all neighbor interactions
+            neighbor_sum = sum_neighbors[j, a, :, :].sum(axis=0)  # shape (3,)
+
+            # Sum over off-diagonal terms within central cell
+            central_offdiag_sum = np.sum(
+                [central_hessian_rs[j, a, k, :] for k in range(natoms) if k != j],
+                axis=0
+            )
+
+            # Set diagonal term explicitly to enforce ASR
+            central_hessian_rs[j, a, j, :] = -(neighbor_sum + central_offdiag_sum)
+
+    # Update central Hessian back into dictionary
+    extended_hessian[central_key] = central_hessian_rs.reshape(n3, n3)
+
+    # Optional: Verify ASR explicitly
+    corrected_central = extended_hessian[central_key]
+    if verbose:
+        print("After ASR enforcement (dictionary structure):")
+    for j in range(natoms):
+        for a in range(3):
+            row_sum = corrected_central[3*j + a, :].sum()
+            print(f" atom {j}, dir {a}: row-sum = {row_sum:.3e}")
+
+    return extended_hessian
+
+
 def energy_extended(nfrags, crd, pbc, potential='sapt'):
     """
     Energy function that mirrors the C++ energy function structure.
@@ -146,9 +241,9 @@ def mass_weight_hessian(hessian, masses, nfrags):
     
     # Mass weight the Hessian: H_mw[i,j] = H[i,j] / sqrt(m_i * m_j)
     mass_weighted_hessian = hessian.copy()
-    for i in range(len(mass_array)):
-        for j in range(len(mass_array)):
-            mass_weighted_hessian[i, j] /= np.sqrt(mass_array[i] * mass_array[j])
+    # Convert nested loops to vectorized operations
+    mass_factors = 1.0 / np.sqrt(np.outer(mass_array, mass_array))
+    mass_weighted_hessian = hessian * mass_factors
     
     return mass_weighted_hessian
 
@@ -259,16 +354,15 @@ def compute_extended_hessian(structure, stepsize=0.005, method='mixed', potentia
         print(f"PBC: {pbc}")
     
     # === GAMMA POINT HESSIAN ===
-    if method == 'analytical' and ANALYTICAL_AVAILABLE:
-        gamma_hessian = compute_gamma_hessian_analytical(crd, nfrags, molecules_grouped, 
-                                                      potential, verbose, use_tqdm)
-    elif method == 'mixed' and ANALYTICAL_AVAILABLE:
+    if (method == 'analytical' or method == 'mixed') and ANALYTICAL_AVAILABLE:
         gamma_hessian = compute_gamma_hessian_analytical(crd, nfrags, molecules_grouped, 
                                                       potential, verbose, use_tqdm)
     else:
         gamma_hessian = compute_gamma_hessian_finite_diff(crd, nfrags, pbc, stepsize, 
                                                        potential, verbose, use_tqdm)
     
+    tmp_gamma_hessian = gamma_hessian.copy()
+
     if verbose:
         print(f"Gamma point Hessian computed using {'analytical' if method in ['analytical', 'mixed'] and ANALYTICAL_AVAILABLE else 'finite differences'}")
     
@@ -294,21 +388,25 @@ def compute_extended_hessian(structure, stepsize=0.005, method='mixed', potentia
         lat = np.array([x, y, z], dtype=float)
         
         # Compute extended Hessian for this shift
-        shift_hessian = compute_shift_hessian_finite_diff(
-            crd, nfrags, pbc, lat, stepsize, potential, verbose, use_tqdm
-        )
+        if method == 'analytical' and ANALYTICAL_AVAILABLE:
+            shift_hessian = compute_shift_hessian_analytical(
+                crd, nfrags, pbc, lat, potential, verbose, use_tqdm
+            )
+        else:
+            shift_hessian = compute_shift_hessian_finite_diff(
+                crd, nfrags, pbc, lat, stepsize, potential, verbose, use_tqdm
+            )
         
         # Store extended Hessian for this shift
         extended_hessian[shift_key] = shift_hessian
 
         # Subtract from gamma point (as in C++ code)
-        gamma_hessian -= shift_hessian
+        tmp_gamma_hessian -= shift_hessian
         
         if verbose:
             print(f"Completed shift {shift_key}")
-
-    extended_hessian[(0, 0, 0)] = gamma_hessian.copy()  # Store gamma point Hessian at (0,0,0)
-
+    
+    extended_hessian[(0, 0, 0)] = tmp_gamma_hessian.copy()  # Store gamma point Hessian at (0,0,0)
     
     elapsed_time = time.time() - start_time
     if verbose:
@@ -341,14 +439,14 @@ def compute_gamma_hessian_analytical(crd, nfrags, molecules_grouped, potential='
     
     # Select functions based on potential
     if potential == 'sapt':
-        p1b_hess_func = p1b_hessian_rev
-        p2b_hess_func = sapt_hessian_rev
+        p1b_hess_func = p1b_hessian_fwd
+        p2b_hess_func = sapt_hessian_fwd
     elif potential == 'p2b_4':
-        p1b_hess_func = p1b_hessian_rev
-        p2b_hess_func = p2b_hessian_4_rev
+        p1b_hess_func = p1b_hessian_fwd
+        p2b_hess_func = p2b_hessian_4_fwd
     elif potential == 'p2b_5':
-        p1b_hess_func = p1b_hessian_rev
-        p2b_hess_func = p2b_hessian_5_rev
+        p1b_hess_func = p1b_hessian_fwd
+        p2b_hess_func = p2b_hessian_5_fwd
     else:
         raise ValueError(f"Unknown potential: {potential}")
     
@@ -483,6 +581,86 @@ def compute_gamma_hessian_finite_diff(crd, nfrags, pbc, stepsize, potential='sap
     
     return gamma_hessian
 
+def compute_shift_hessian_analytical(crd, nfrags, pbc, lat, potential='sapt',
+                                   verbose=False, use_tqdm=True):
+    """
+    Compute Hessian for a specific lattice shift using analytical derivatives.
+    
+    Parameters:
+    -----------
+    crd : np.array
+        Flattened coordinates array
+    nfrags : int
+        Number of fragments (molecules)
+    pbc : np.array
+        Periodic boundary conditions
+    lat : np.array
+        Lattice shift vector
+    potential : str
+        Type of potential to use ('sapt', 'p2b_4', 'p2b_5')
+    verbose : bool
+        If True, print detailed information
+    use_tqdm : bool
+        If True, show progress bars
+        
+    Returns:
+    --------
+    np.ndarray
+        Shift Hessian matrix for the specified lattice shift
+    """
+    ncoord = nfrags * 9
+    shift_hessian = np.zeros((ncoord, ncoord))
+    
+    # Select potential functions based on potential type
+    if potential == 'sapt':
+        p2b_hess_func = sapt_hessian_fwd
+    elif potential == 'p2b_4':
+        p2b_hess_func = p2b_hessian_4_fwd
+    elif potential == 'p2b_5':
+        p2b_hess_func = p2b_hessian_5_fwd
+    else:
+        raise ValueError(f"Unknown potential: {potential}")
+    
+    shift_str = f"({lat[0]}, {lat[1]}, {lat[2]})"
+    if verbose:
+        print(f"Computing shift Hessian for {shift_str} using analytical derivatives...")
+    
+    # Create fragment pair iterator with or without progress bar
+    frag_pairs = [(i, j) for i in range(nfrags) for j in range(nfrags)]
+    if use_tqdm and TQDM_AVAILABLE:
+        frag_iterator = tqdm(frag_pairs, desc=f"Shift {shift_str} (analytical)")
+    else:
+        frag_iterator = frag_pairs
+    
+    for ifrag, jfrag in frag_iterator:
+        # Extract fragment coordinates
+        i_start, i_end = ifrag * 9, (ifrag + 1) * 9
+        j_start, j_end = jfrag * 9, (jfrag + 1) * 9
+        
+        mol_i = crd[i_start:i_end].copy()
+        mol_j = crd[j_start:j_end].copy()
+        
+        # Apply lattice shift to second molecule
+        for p in range(9):
+            coord_type = p % 3  # x, y, or z coordinate
+            mol_j[p] += lat[coord_type] * pbc[coord_type]
+        
+        # Compute analytical Hessian for this dimer
+        dimer_coords = np.concatenate([mol_i, mol_j])
+        dimer_hessian = p2b_hess_func(dimer_coords)
+        
+        # Map the dimer Hessian blocks to the shift Hessian
+        shift_hessian[i_start:i_end, i_start:i_end] += dimer_hessian[:9, :9]   # i-i block
+        shift_hessian[i_start:i_end, j_start:j_end] += dimer_hessian[:9, 9:]   # i-j block
+        shift_hessian[j_start:j_end, i_start:i_end] += dimer_hessian[9:, :9]   # j-i block
+        shift_hessian[j_start:j_end, j_start:j_end] += dimer_hessian[9:, 9:]   # j-j block
+    
+    # Ensure the shift Hessian is symmetric (should already be from analytical functions,
+    # but enforce it to be safe)
+    shift_hessian = 0.5 * (shift_hessian + shift_hessian.T)
+    
+    return shift_hessian
+
 def compute_shift_hessian_finite_diff(crd, nfrags, pbc, lat, stepsize, potential='sapt',
                                     verbose=False, use_tqdm=True):
     """
@@ -569,6 +747,7 @@ def compute_shift_hessian_finite_diff(crd, nfrags, pbc, lat, stepsize, potential
                 
                 dd = (d0[1] - d0[0]) / (2 * stepsize)
                 shift_hessian[global_n0, global_n1] = dd
+                shift_hessian[global_n1, global_n0] = dd
     
     return shift_hessian
 
@@ -616,7 +795,9 @@ def compute_hessian_at_structure(structure, stepsize=0.005, method='mixed', pote
     # Compute eigenvalues for stability analysis
     if verbose:
         print("Computing eigenvalues and eigenvectors...")
+
     eigenvals, eigenvects = np.linalg.eigh(mass_weighted_gamma)
+
     # Sum all mass-weighted extended Hessian matrices into one
     summed_mass_weighted_extended = np.zeros_like(mass_weighted_gamma)
     for hess in mass_weighted_extended.values():
@@ -650,7 +831,7 @@ def compute_hessian_at_structure(structure, stepsize=0.005, method='mixed', pote
         'method': method,
         'potential': potential
     }
-    
+
     if verbose:
         print(f"\nHessian analysis (method: {method}, potential: {potential}):")
         print(f"  Matrix size: {gamma_hessian.shape[0]}x{gamma_hessian.shape[1]}")
@@ -683,6 +864,9 @@ def compute_hessian_at_structure(structure, stepsize=0.005, method='mixed', pote
         print(f"  Mean absolute element: {np.mean(np.abs(gamma_hessian)):.8f}")
         print(f"  Frobenius norm: {np.linalg.norm(gamma_hessian):.8f}")
         
+        extended_hessian = enforce_asr_extended_hessian(extended_hessian, verbose)
+        debug_hessian(gamma_hessian)
+
         # Check symmetry
         symmetry_error = np.max(np.abs(gamma_hessian - gamma_hessian.T))
         print(f"  Symmetry error: {symmetry_error:.2e}")
@@ -737,347 +921,9 @@ def compare_hessian_methods(structure, stepsize=0.005, potential='sapt'):
         'max_freq_diff': max_freq_diff
     }
 
-def save_hessian_extended(results, filename="hessian_extended", include_metadata=True, format="npy", combine_extended=True):
-    """
-    Save extended Hessian results and optionally metadata.
-    
-    Parameters:
-        results (dict): Results from compute_hessian_at_structure
-        filename (str): Base output filename (without extension)
-        include_metadata (bool): Whether to save metadata
-        format (str): Format to save ('npy', 'pkl', or 'h5')
-        combine_extended (bool): Whether to combine all extended Hessians into one file
-    
-    Returns:
-        str: Path to the saved file
-    """
-    import json
-    import time
-    import os
-    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
-    
-    # Ensure the base path exists
-    directory = os.path.dirname(filename)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory)
-    
-    # Save the Hessian results in the specified format
-    if format.lower() == 'npy':
-        # Save gamma point Hessian
-        gamma_file = f"{filename}_gamma.npy"
-        np.save(gamma_file, results['gamma_hessian'])
-        
-        # Save mass-weighted Hessian
-        if 'mass_weighted_gamma' in results:
-            mass_weighted_file = f"{filename}_mass_weighted.npy"
-            np.save(mass_weighted_file, results['mass_weighted_gamma'])
-        
-        # Save eigenvalues and eigenvectors
-        eigenvals_file = f"{filename}_eigenvals.npy"
-        eigenvects_file = f"{filename}_eigenvects.npy"
-        np.save(eigenvals_file, results['eigenvalues'])
-        np.save(eigenvects_file, results['eigenvectors'])
-        
-        # Save frequencies
-        if 'frequencies_cm1' in results:
-            frequencies_file = f"{filename}_frequencies.npy"
-            np.save(frequencies_file, results['frequencies_cm1'])
-        
-        # Save extended Hessian matrices
-        extended_files = {}
-        if 'extended_hessian' in results:
-            if combine_extended:
-                # Combine all extended Hessians into a single structured array
-                extended_combined = {}
-                shift_keys = []
-                
-                for shift_key, shift_hessian in results['extended_hessian'].items():
-                    # Convert shift key to string for dictionary key
-                    shift_str = f"{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
-                    extended_combined[shift_str] = shift_hessian
-                    shift_keys.append(shift_key)
-                
-                # Save combined extended Hessian
-                extended_combined_file = f"{filename}_extended_combined.npz"
-                np.savez_compressed(extended_combined_file, **extended_combined)
-                extended_files['combined'] = extended_combined_file
-                
-                print(f"Saved {len(extended_combined)} extended Hessian matrices to {extended_combined_file}")
-                
-            else:
-                # Save each extended Hessian separately (original behavior)
-                for shift_key, shift_hessian in results['extended_hessian'].items():
-                    shift_str = f"{shift_key[0]}{shift_key[1]}{shift_key[2]}"
-                    extended_file = f"{filename}_extended_{shift_str}.npy"
-                    np.save(extended_file, shift_hessian)
-                    extended_files[shift_str] = extended_file
-        
-        # Save metadata separately if requested
-        if include_metadata:
-            metadata = {
-                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-                'method': results.get('method', 'unknown'),
-                'potential': results.get('potential', 'unknown'),
-                'stepsize': float(results.get('stepsize', 0.005)),
-                'n_negative_modes': int(results.get('n_negative_modes', 0)),
-                'n_imaginary_freqs': int(results.get('n_imaginary_freqs', 0)),
-                'gamma_hessian_shape': list(results['gamma_hessian'].shape),
-                'combine_extended': combine_extended,
-                'files': {
-                    'gamma_hessian': os.path.basename(gamma_file),
-                    'eigenvals': os.path.basename(eigenvals_file),
-                    'eigenvects': os.path.basename(eigenvects_file)
-                }
-            }
-            
-            if 'mass_weighted_gamma' in results:
-                metadata['files']['mass_weighted_gamma'] = os.path.basename(mass_weighted_file)
-            
-            if 'frequencies_cm1' in results:
-                metadata['files']['frequencies'] = os.path.basename(frequencies_file)
-                metadata['frequency_range'] = [float(np.min(results['frequencies_cm1'])), 
-                                             float(np.max(results['frequencies_cm1']))]
-            
-            if extended_files:
-                metadata['files']['extended_hessian'] = extended_files
-                metadata['extended_shifts'] = [[int(k[0]), int(k[1]), int(k[2])] 
-                                             for k in results['extended_hessian'].keys()]
-            
-            # Add eigenvalue statistics
-            if 'eigenvalues' in results:
-                metadata['eigenvalue_stats'] = {
-                    'min': float(np.min(results['eigenvalues'])),
-                    'max': float(np.max(results['eigenvalues'])),
-                    'count': int(len(results['eigenvalues']))
-                }
-            
-            # Save metadata to JSON file
-            meta_filename = f"{filename}_metadata.json"
-            with open(meta_filename, 'w') as f:
-                json.dump(metadata, f, indent=2)
-                
-        return gamma_file
-        
-    elif format.lower() == 'pkl':
-        import pickle
-        
-        # Package all data into a single dictionary
-        data = {
-            'results': results,
-            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        
-        full_filename = f"{filename}.pkl"
-        with open(full_filename, 'wb') as f:
-            pickle.dump(data, f)
-            
-        return full_filename
-        
-    elif format.lower() == 'h5':
-        import h5py
-        full_filename = f"{filename}.h5"
-        
-        with h5py.File(full_filename, 'w') as f:
-            # Save gamma point Hessian
-            f.create_dataset('gamma_hessian', data=results['gamma_hessian'])
-            
-            # Save mass-weighted Hessian
-            if 'mass_weighted_gamma' in results:
-                f.create_dataset('mass_weighted_gamma', data=results['mass_weighted_gamma'])
-            
-            # Save eigenvalues and eigenvectors
-            f.create_dataset('eigenvalues', data=results['eigenvalues'])
-            f.create_dataset('eigenvectors', data=results['eigenvectors'])
-            
-            # Save frequencies
-            if 'frequencies_cm1' in results:
-                f.create_dataset('frequencies', data=results['frequencies_cm1'])
-            
-            # Save extended Hessian matrices
-            if 'extended_hessian' in results:
-                extended_group = f.create_group('extended_hessian')
-                for shift_key, shift_hessian in results['extended_hessian'].items():
-                    shift_str = f"{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
-                    extended_group.create_dataset(shift_str, data=shift_hessian)
-            
-            # Save metadata as attributes (convert numpy types to native Python types)
-            f.attrs['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S")
-            f.attrs['method'] = results.get('method', 'unknown')
-            f.attrs['potential'] = results.get('potential', 'unknown')
-            f.attrs['stepsize'] = float(results.get('stepsize', 0.005))
-            f.attrs['n_negative_modes'] = int(results.get('n_negative_modes', 0))
-            f.attrs['n_imaginary_freqs'] = int(results.get('n_imaginary_freqs', 0))
-            
-        return full_filename
-        
-    else:
-        raise ValueError(f"Unsupported format: {format}. Choose from 'npy', 'pkl', or 'h5'.")
-
-def load_hessian_extended(filename, load_metadata=True):
-    """
-    Load extended Hessian results and optionally metadata.
-    
-    Parameters:
-        filename (str): Path to the file to load (can be base name or specific file)
-        load_metadata (bool): Whether to load metadata (if available)
-    
-    Returns:
-        tuple: (results_dict, metadata) where metadata may be None
-    """
-    import os
-    import json
-    
-    # Determine file type and base filename
-    if filename.endswith('.npy'):
-        # Handle .npy format - assume it's the gamma hessian file
-        if '_gamma.npy' in filename:
-            base_filename = filename.replace('_gamma.npy', '')
-        else:
-            base_filename = filename.replace('.npy', '')
-        
-        # Load gamma point Hessian
-        gamma_file = f"{base_filename}_gamma.npy"
-        if not os.path.exists(gamma_file):
-            raise FileNotFoundError(f"Gamma Hessian file not found: {gamma_file}")
-        
-        gamma_hessian = np.load(gamma_file)
-        
-        # Initialize results dictionary
-        results = {'gamma_hessian': gamma_hessian}
-        
-        # Load mass-weighted Hessian if available
-        mass_weighted_file = f"{base_filename}_mass_weighted.npy"
-        if os.path.exists(mass_weighted_file):
-            results['mass_weighted_gamma'] = np.load(mass_weighted_file)
-        
-        # Load eigenvalues and eigenvectors
-        eigenvals_file = f"{base_filename}_eigenvals.npy"
-        eigenvects_file = f"{base_filename}_eigenvects.npy"
-        
-        if os.path.exists(eigenvals_file):
-            results['eigenvalues'] = np.load(eigenvals_file)
-        if os.path.exists(eigenvects_file):
-            results['eigenvectors'] = np.load(eigenvects_file)
-        
-        # Load frequencies
-        frequencies_file = f"{base_filename}_frequencies.npy"
-        if os.path.exists(frequencies_file):
-            results['frequencies_cm1'] = np.load(frequencies_file)
-        
-        # Load extended Hessian matrices
-        extended_hessian = {}
-        
-        # First, try to load combined extended Hessian file
-        combined_file = f"{base_filename}_extended_combined.npz"
-        if os.path.exists(combined_file):
-            print(f"Loading combined extended Hessian from {combined_file}")
-            with np.load(combined_file) as data:
-                for shift_str in data.files:
-                    # Convert shift_str back to tuple (e.g., "-1_0_1" -> (-1, 0, 1))
-                    shift_parts = shift_str.split('_')
-                    if len(shift_parts) == 3:
-                        try:
-                            shift_key = (int(shift_parts[0]), int(shift_parts[1]), int(shift_parts[2]))
-                            extended_hessian[shift_key] = data[shift_str]
-                        except ValueError:
-                            print(f"Warning: Could not parse shift key from {shift_str}")
-        
-        # If no combined file, try to load individual files
-        if not extended_hessian:
-            directory = os.path.dirname(base_filename) if os.path.dirname(base_filename) else '.'
-            base_name = os.path.basename(base_filename)
-            
-            for file in os.listdir(directory):
-                if file.startswith(f"{base_name}_extended_") and file.endswith('.npy'):
-                    # Extract shift key from filename
-                    shift_str = file.replace(f"{base_name}_extended_", "").replace('.npy', '')
-                    if len(shift_str) == 3:  # Should be like "000", "100", etc.
-                        try:
-                            shift_key = (int(shift_str[0])-1, int(shift_str[1])-1, int(shift_str[2])-1)
-                            extended_hessian[shift_key] = np.load(os.path.join(directory, file))
-                        except (ValueError, IndexError):
-                            print(f"Warning: Could not parse shift key from {file}")
-        
-        if extended_hessian:
-            results['extended_hessian'] = extended_hessian
-            print(f"Loaded {len(extended_hessian)} extended Hessian matrices")
-        
-        # Load metadata
-        metadata = None
-        if load_metadata:
-            meta_filename = f"{base_filename}_metadata.json"
-            if os.path.exists(meta_filename):
-                with open(meta_filename, 'r') as f:
-                    metadata = json.load(f)
-        
-        return results, metadata
-        
-    elif filename.endswith('.pkl'):
-        import pickle
-        
-        with open(filename, 'rb') as f:
-            data = pickle.load(f)
-            
-        # Extract results and metadata
-        results = data['results']
-        del data['results']  # Remove results from metadata
-        
-        return results, data if load_metadata else None
-        
-    elif filename.endswith('.h5'):
-        import h5py
-        
-        with h5py.File(filename, 'r') as f:
-            # Load gamma point Hessian
-            results = {
-                'gamma_hessian': f['gamma_hessian'][()],
-                'eigenvalues': f['eigenvalues'][()],
-                'eigenvectors': f['eigenvectors'][()]
-            }
-            
-            # Load mass-weighted Hessian if available
-            if 'mass_weighted_gamma' in f:
-                results['mass_weighted_gamma'] = f['mass_weighted_gamma'][()]
-            
-            # Load frequencies if available
-            if 'frequencies' in f:
-                results['frequencies_cm1'] = f['frequencies'][()]
-            
-            # Load extended Hessian matrices
-            if 'extended_hessian' in f:
-                extended_hessian = {}
-                extended_group = f['extended_hessian']
-                for shift_str in extended_group.keys():
-                    # Convert shift_str back to tuple (e.g., "0_0_0" -> (0, 0, 0))
-                    shift_parts = shift_str.split('_')
-                    if len(shift_parts) == 3:
-                        try:
-                            shift_key = (int(shift_parts[0]), int(shift_parts[1]), int(shift_parts[2]))
-                            extended_hessian[shift_key] = extended_group[shift_str][()]
-                        except ValueError:
-                            print(f"Warning: Could not parse shift key from {shift_str}")
-                
-                if extended_hessian:
-                    results['extended_hessian'] = extended_hessian
-            
-            # Load metadata if requested
-            metadata = None
-            if load_metadata:
-                metadata = {
-                    'timestamp': f.attrs.get('timestamp', None),
-                    'method': f.attrs.get('method', 'unknown'),
-                    'potential': f.attrs.get('potential', 'unknown'),
-                    'stepsize': f.attrs.get('stepsize', 0.005),
-                    'n_negative_modes': f.attrs.get('n_negative_modes', 0),
-                    'n_imaginary_freqs': f.attrs.get('n_imaginary_freqs', 0)
-                }
-            
-            return results, metadata
-    else:
-        raise ValueError(f"Unsupported file format: {filename}. Expected .npy, .pkl, or .h5")
 
 # Alternative: Save everything in a single .npz file
-def save_hessian_all_in_one(results, filename="hessian_all", include_metadata=True):
+def save_hessian_all_in_one(results, filename="hessian_all", include_metadata=True, verbose=False):
     """
     Save all Hessian results in a single .npz file.
     
@@ -1102,29 +948,19 @@ def save_hessian_all_in_one(results, filename="hessian_all", include_metadata=Tr
     save_data = {
         'gamma_hessian': results['gamma_hessian'],
         'eigenvalues': results['eigenvalues'],
-        'eigenvectors': results['eigenvectors']
+        'eigenvectors': results['eigenvectors'],
+        'mass_weighted_gamma': results['mass_weighted_gamma'],
+        'frequencies': results['frequencies_cm1'],
     }
-    
-
-    print(f"Saving Hessian data to {filename}.npz")
-    # Add optional arrays
-    if 'mass_weighted_gamma' in results:
-        save_data['mass_weighted_gamma'] = results['mass_weighted_gamma']
-    
-    if 'frequencies_cm1' in results:
-        save_data['frequencies'] = results['frequencies_cm1']
-    
     # Add extended Hessian matrices
-    if 'extended_hessian' in results:
-        for shift_key, shift_hessian in results['extended_hessian'].items():
-            shift_str = f"extended_{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
-            save_data[shift_str] = shift_hessian
-    
+    for shift_key, shift_hessian in results['extended_hessian'].items():
+        shift_str = f"extended_{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
+        save_data[shift_str] = shift_hessian
+
     # Add mass-weighted extended Hessian matrices
-    if 'mass_weighted_extended' in results:
-        for shift_key, shift_hessian in results['mass_weighted_extended'].items():
-            shift_str = f"mass_weighted_extended_{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
-            save_data[shift_str] = shift_hessian
+    for shift_key, shift_hessian in results['mass_weighted_extended'].items():
+        shift_str = f"mass_weighted_extended_{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
+        save_data[shift_str] = shift_hessian
     
     # Save all data in compressed format
     full_filename = f"{filename}.npz"
@@ -1142,28 +978,25 @@ def save_hessian_all_in_one(results, filename="hessian_all", include_metadata=Tr
             'gamma_hessian_shape': list(results['gamma_hessian'].shape),
             'data_keys': list(save_data.keys())
         }
+        metadata['extended_shifts'] = [[int(k[0]), int(k[1]), int(k[2])] 
+                                for k in results['extended_hessian'].keys()]
         
-        if 'extended_hessian' in results:
-            metadata['extended_shifts'] = [[int(k[0]), int(k[1]), int(k[2])] 
-                                         for k in results['extended_hessian'].keys()]
-        
-        # Add eigenvalue statistics
-        if 'eigenvalues' in results:
-            metadata['eigenvalue_stats'] = {
-                'min': float(np.min(results['eigenvalues'])),
-                'max': float(np.max(results['eigenvalues'])),
-                'count': int(len(results['eigenvalues']))
-            }
-        
+        metadata['eigenvalue_stats'] = {
+            'min': float(np.min(results['eigenvalues'])),
+            'max': float(np.max(results['eigenvalues'])),
+            'count': int(len(results['eigenvalues']))
+        }
+    
         # Save metadata to JSON file
         meta_filename = f"{filename}_metadata.json"
         with open(meta_filename, 'w') as f:
             json.dump(metadata, f, indent=2)
-    
-    print(f"Saved all Hessian data to {full_filename}")
+
+    if verbose:
+        print(f"Saved all Hessian data to {full_filename}")
     return full_filename
 
-def load_hessian_all_in_one(filename, load_metadata=True):
+def load_hessian_all_in_one(filename, load_metadata=True, verbose=False):
     """
     Load all Hessian results from a single .npz file.
     
@@ -1185,16 +1018,12 @@ def load_hessian_all_in_one(filename, load_metadata=True):
         results = {
             'gamma_hessian': data['gamma_hessian'],
             'eigenvalues': data['eigenvalues'],
-            'eigenvectors': data['eigenvectors']
+            'eigenvectors': data['eigenvectors'],
+            'mass_weighted_gamma': data['mass_weighted_gamma'],
+            'frequencies_cm1': data['frequencies']
+
         }
-        
-        # Load optional arrays
-        if 'mass_weighted_gamma' in data:
-            results['mass_weighted_gamma'] = data['mass_weighted_gamma']
-        
-        if 'frequencies' in data:
-            results['frequencies_cm1'] = data['frequencies']
-        
+
         # Load extended Hessian matrices
         extended_hessian = {}
         mass_weighted_extended = {}
@@ -1207,7 +1036,7 @@ def load_hessian_all_in_one(filename, load_metadata=True):
                 shift_parts = shift_str.split('_')
                 if len(shift_parts) == 3:
                     try:
-                        shift_key = (int(shift_parts[0]), int(shift_parts[1]), int(shift_parts[2]))
+                        shift_key = tuple(int(p) for p in shift_parts)
                         extended_hessian[shift_key] = data[key]
                     except ValueError:
                         print(f"Warning: Could not parse shift key from {key}")
@@ -1218,18 +1047,20 @@ def load_hessian_all_in_one(filename, load_metadata=True):
                 shift_parts = shift_str.split('_')
                 if len(shift_parts) == 3:
                     try:
-                        shift_key = (int(shift_parts[0]), int(shift_parts[1]), int(shift_parts[2]))
+                        shift_key = tuple(int(p) for p in shift_parts)
                         mass_weighted_extended[shift_key] = data[key]
                     except ValueError:
                         print(f"Warning: Could not parse shift key from {key}")
         
         if extended_hessian:
             results['extended_hessian'] = extended_hessian
-            print(f"Loaded {len(extended_hessian)} extended Hessian matrices")
+            if verbose:
+                print(f"Loaded {len(extended_hessian)} extended Hessian matrices")
         
         if mass_weighted_extended:
             results['mass_weighted_extended'] = mass_weighted_extended
-            print(f"Loaded {len(mass_weighted_extended)} mass-weighted extended Hessian matrices")
+            if verbose:
+                print(f"Loaded {len(mass_weighted_extended)} mass-weighted extended Hessian matrices")
     
     # Load metadata
     metadata = None
@@ -1239,6 +1070,200 @@ def load_hessian_all_in_one(filename, load_metadata=True):
         if os.path.exists(meta_filename):
             with open(meta_filename, 'r') as f:
                 metadata = json.load(f)
+    
+    return results, metadata
+
+def save_hessian_h5(results, filename="hessian_data", include_metadata=True, verbose=False):
+    """
+    Save all Hessian results in a single HDF5 file.
+    
+    Parameters:
+        results (dict): Results from compute_hessian_at_structure
+        filename (str): Base output filename (without extension)
+        include_metadata (bool): Whether to save metadata as attributes
+        verbose (bool): Whether to print verbose output
+    
+    Returns:
+        str: Path to the saved file
+    """
+    import time
+    import os
+    import h5py
+    
+    # Ensure the base path exists
+    directory = os.path.dirname(filename)
+    if directory and not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    # Add .h5 extension if not present
+    full_filename = f"{filename}.h5" if not filename.endswith('.h5') else filename
+    
+    with h5py.File(full_filename, 'w') as f:
+        # Create main groups
+        main_group = f.create_group('hessian_data')
+        extended_group = main_group.create_group('extended_hessian')
+        mass_weighted_group = main_group.create_group('mass_weighted_extended')
+        
+        # Save core arrays
+        main_arrays = {
+            'gamma_hessian': results['gamma_hessian'],
+            'eigenvalues': results['eigenvalues'],
+            'eigenvectors': results['eigenvectors'],
+            'mass_weighted_gamma': results['mass_weighted_gamma'],
+            'frequencies_cm1': results['frequencies_cm1']
+        }
+        
+        for key, array in main_arrays.items():
+            main_group.create_dataset(key, data=array, compression="gzip", compression_opts=9)
+        
+        # Save extended Hessian matrices
+        for shift_key, shift_hessian in results['extended_hessian'].items():
+            shift_str = f"{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
+            extended_group.create_dataset(shift_str, data=shift_hessian, 
+                                        compression="gzip", compression_opts=9)
+        
+        # Save mass-weighted extended Hessian matrices
+        for shift_key, shift_hessian in results['mass_weighted_extended'].items():
+            shift_str = f"{shift_key[0]}_{shift_key[1]}_{shift_key[2]}"
+            mass_weighted_group.create_dataset(shift_str, data=shift_hessian, 
+                                             compression="gzip", compression_opts=9)
+        
+        # Add metadata as attributes if requested
+        if include_metadata:
+            attrs = main_group.attrs
+            attrs['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S")
+            attrs['method'] = results.get('method', 'unknown')
+            attrs['potential'] = results.get('potential', 'unknown')
+            attrs['stepsize'] = float(results.get('stepsize', 0.005))
+            attrs['n_negative_modes'] = int(results.get('n_negative_modes', 0))
+            attrs['n_imaginary_freqs'] = int(results.get('n_imaginary_freqs', 0))
+            attrs['gamma_hessian_shape'] = str(list(results['gamma_hessian'].shape))
+            
+            # Save extended shifts
+            shift_list = []
+            for shift_key in results['extended_hessian'].keys():
+                shift_list.append(f"{shift_key[0]},{shift_key[1]},{shift_key[2]}")
+            
+            attrs['extended_shifts'] = ';'.join(shift_list)
+            attrs['eigenvalue_min'] = float(np.min(results['eigenvalues']))
+            attrs['eigenvalue_max'] = float(np.max(results['eigenvalues']))
+            attrs['eigenvalue_count'] = int(len(results['eigenvalues']))
+    
+    if verbose:
+        print(f"Saved all Hessian data to {full_filename}")
+    
+    return full_filename
+
+def load_hessian_h5(filename, load_metadata=True, verbose=False):
+    """
+    Load all Hessian results from an HDF5 file.
+    
+    Parameters:
+        filename (str): Path to the HDF5 file
+        load_metadata (bool): Whether to load metadata
+        verbose (bool): Whether to print verbose output
+    
+    Returns:
+        tuple: (results_dict, metadata) where metadata may be None
+    """
+    import h5py
+    import os
+    
+    # Add .h5 extension if not present
+    filename = f"{filename}.h5" if not filename.endswith('.h5') else filename
+    
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"HDF5 file not found: {filename}")
+    
+    with h5py.File(filename, 'r') as f:
+        # Check if the expected structure exists
+        if 'hessian_data' not in f:
+            raise ValueError(f"Invalid HDF5 file format: missing 'hessian_data' group")
+        
+        main_group = f['hessian_data']
+        results = {}
+        
+        # Load core arrays
+        for key in ['gamma_hessian', 'eigenvalues', 'eigenvectors', 'mass_weighted_gamma', 'frequencies_cm1']:
+            if key in main_group:
+                results[key] = main_group[key][()]
+            elif key == 'frequencies_cm1' and 'frequencies' in main_group:
+                # Handle possible name variations
+                results[key] = main_group['frequencies'][()]
+        
+        # Load extended Hessian matrices
+        if 'extended_hessian' in main_group:
+            extended_group = main_group['extended_hessian']
+            extended_hessian = {}
+            
+            for shift_str in extended_group:
+                shift_parts = shift_str.split('_')
+                if len(shift_parts) == 3:
+                    try:
+                        shift_key = tuple(int(p) for p in shift_parts)
+                        extended_hessian[shift_key] = extended_group[shift_str][()]
+                    except ValueError:
+                        if verbose:
+                            print(f"Warning: Could not parse shift key from {shift_str}")
+            
+            results['extended_hessian'] = extended_hessian
+            if verbose:
+                print(f"Loaded {len(extended_hessian)} extended Hessian matrices")
+        
+        # Load mass-weighted extended Hessian matrices
+        if 'mass_weighted_extended' in main_group:
+            mass_weighted_group = main_group['mass_weighted_extended']
+            mass_weighted_extended = {}
+            
+            for shift_str in mass_weighted_group:
+                shift_parts = shift_str.split('_')
+                if len(shift_parts) == 3:
+                    try:
+                        shift_key = tuple(int(p) for p in shift_parts)
+                        mass_weighted_extended[shift_key] = mass_weighted_group[shift_str][()]
+                    except ValueError:
+                        if verbose:
+                            print(f"Warning: Could not parse shift key from {shift_str}")
+            
+            results['mass_weighted_extended'] = mass_weighted_extended
+            if verbose:
+                print(f"Loaded {len(mass_weighted_extended)} mass-weighted extended Hessian matrices")
+        
+        # Load metadata if requested
+        metadata = None
+        if load_metadata and hasattr(main_group, 'attrs'):
+            attrs = main_group.attrs
+            metadata = {key: attrs[key] for key in attrs}
+            
+            # Convert shape string back to list if needed
+            if 'gamma_hessian_shape' in metadata and isinstance(metadata['gamma_hessian_shape'], str):
+                try:
+                    import ast
+                    metadata['gamma_hessian_shape'] = ast.literal_eval(metadata['gamma_hessian_shape'])
+                except (ValueError, SyntaxError):
+                    if verbose:
+                        print("Warning: Could not parse gamma_hessian_shape attribute")
+            
+            # Convert extended shifts string back to list
+            if 'extended_shifts' in metadata:
+                try:
+                    shifts_str = metadata['extended_shifts']
+                    shifts = []
+                    for shift_str in shifts_str.split(';'):
+                        x, y, z = map(int, shift_str.split(','))
+                        shifts.append([x, y, z])
+                    metadata['extended_shifts'] = shifts
+                except (ValueError, AttributeError):
+                    if verbose:
+                        print("Warning: Could not parse extended_shifts attribute")
+    
+    if verbose:
+        print(f"Successfully loaded data from {filename}")
+        print(f"  Gamma Hessian shape: {results['gamma_hessian'].shape}")
+        if 'extended_hessian' in results:
+            print(f"  Extended Hessians: {len(results['extended_hessian'])}")
+        if 'mass_weighted_extended' in results:
+            print(f"  Mass-weighted Extended Hessians: {len(results['mass_weighted_extended'])}")
     
     return results, metadata
 
@@ -1260,13 +1285,15 @@ if __name__ == "__main__":
                       help='Disable progress bars')
     parser.add_argument('--test-save-load', action='store_true', 
                       help='Test save/load functionality')
+    parser.add_argument('--format', choices=['npz', 'h5', 'both'], default='both',
+                      help='File format for saving Hessian data')
     
     args = parser.parse_args()
     
     # Test with Pa3 structure
     print("Computing extended Hessian...")
     
-    pa3_structure = Pa3(a=5.4848)
+    pa3_structure = Pa3(a=5.48469436)
     pa3_structure.adjust_fractional_coords(bond_length=1.1609)
     structure = build_unit_cell(pa3_structure)
     
@@ -1283,6 +1310,7 @@ if __name__ == "__main__":
         args.potential = 'sapt'
     
     try:
+        # Calculate Hessian
         results = compute_hessian_at_structure(
             structure, 
             stepsize=args.stepsize, 
@@ -1292,25 +1320,32 @@ if __name__ == "__main__":
             use_tqdm=args.use_tqdm
         )
         
-        save_hessian_all_in_one(results, filename="hessian_all", include_metadata=True)
+        # Save files based on requested format
+        if args.format in ['npz', 'both']:
+            npz_file = save_hessian_all_in_one(results, filename="test_hessian", 
+                                             include_metadata=True, verbose=args.verbose)
+            print(f"NPZ file saved: {npz_file}")
 
-        # Test save/load functionality if requested
+        if args.format in ['h5', 'both']:
+            h5_file = save_hessian_h5(results, filename="test_hessian", 
+                                    include_metadata=True, verbose=args.verbose)
+            print(f"HDF5 file saved: {h5_file}")
+
+        # Test data integrity if requested
         if args.test_save_load:
-            test_filename = f"test_pa3_{args.method}_{args.potential}"
+            print("\nTesting data integrity...")
             
-            # Test combined extended Hessian in .npz format
-            print(f"Testing combined extended Hessian save/load...")
-            saved_file = save_hessian_extended(
-                results, 
-                test_filename + "_combined",
-                format="npy", 
-                combine_extended=True
-            )
-            loaded_results, loaded_metadata = load_hessian_extended(saved_file)
+            if args.format in ['npz', 'both']:
+                npz_data, npz_meta = load_hessian_all_in_one("test_hessian", verbose=args.verbose)
+                npz_match = np.allclose(results['gamma_hessian'], npz_data['gamma_hessian'])
+                print(f"NPZ integrity check: {'PASSED' if npz_match else 'FAILED'}")
             
-            # Verify data integrity
-            gamma_match = np.allclose(results['gamma_hessian'], loaded_results['gamma_hessian'])
-            print(f"  Data integrity check: {'PASSED' if gamma_match else 'FAILED'}")
+            if args.format in ['h5', 'both']:
+                h5_data, h5_meta = load_hessian_h5("test_hessian", verbose=args.verbose)
+                h5_match = np.allclose(results['gamma_hessian'], h5_data['gamma_hessian'])
+                print(f"HDF5 integrity check: {'PASSED' if h5_match else 'FAILED'}")
             
     except Exception as e:
         print(f"Error with {args.method}/{args.potential}: {e}")
+        import traceback
+        traceback.print_exc()
