@@ -41,7 +41,7 @@ def write_extended_hessian_txt(extended_hessian, outfilename):
             f.write(f"{shift[0]} {shift[1]} {shift[2]}\n")
             f.write(''.join(f"{x:.8f}\n" for x in flat))
 
-def calculate_gamma_phonons(hessian_data, structure, remove_acoustic=True):
+def calculate_gamma_phonons(hessian_data, remove_acoustic=False):
     """
     Calculate phonon frequencies at the gamma point (q=0,0,0).
     
@@ -60,21 +60,9 @@ def calculate_gamma_phonons(hessian_data, structure, remove_acoustic=True):
         Dictionary containing frequencies and eigenvectors
     """
     print("Calculating gamma point phonons...")
-    
+
     # Extract data from the hessian_data dictionary
-    if 'mass_weighted_gamma' in hessian_data:
-        hessian = hessian_data['mass_weighted_gamma']
-    else:
-        hessian = hessian_data['hessian']
-        # Mass-weight the Hessian if not already done
-        masses = []
-        for site in structure:
-            mass = site.specie.atomic_mass * AMU  # Convert to kg
-            masses.extend([mass, mass, mass])  # One mass for each direction (x,y,z)
-        
-        masses = np.array(masses)
-        mass_matrix = np.outer(1.0/np.sqrt(masses), 1.0/np.sqrt(masses))
-        hessian = hessian * mass_matrix
+    hessian = hessian_data
     
     # Diagonalize the Hessian to get eigenvalues and eigenvectors
     eigenvalues, eigenvectors = np.linalg.eigh(hessian)
@@ -88,10 +76,6 @@ def calculate_gamma_phonons(hessian_data, structure, remove_acoustic=True):
     frequencies = frequencies[idx]
     eigenvectors = eigenvectors[:, idx]
     
-    # If requested, project out acoustic modes (set first 3 to ~0)
-    if remove_acoustic and len(frequencies) > 3:
-        frequencies[:3] = 0.0
-    
     return {
         'frequencies': frequencies,
         'eigenvectors': eigenvectors
@@ -100,7 +84,7 @@ def calculate_gamma_phonons(hessian_data, structure, remove_acoustic=True):
 def calculate_phonon_dispersion(hessian_data, structure, path=None, symm_points=None, n_points=50, remove_acoustic=True):
     """
     Calculate phonon dispersion along a path in the Brillouin zone.
-    
+
     Parameters:
     -----------
     hessian_data : dict
@@ -115,89 +99,91 @@ def calculate_phonon_dispersion(hessian_data, structure, path=None, symm_points=
         Number of points along each path segment
     remove_acoustic : bool
         Whether to project out acoustic modes
-        
+
     Returns:
     --------
     dict
         Dictionary containing dispersion data
     """
-    print("Calculating phonon dispersion...")
-    
+    #print("Calculating phonon dispersion...")
+
     # Get high symmetry points if not provided
     if symm_points is None:
         symm_points = get_high_symmetry_points(structure.lattice)
-    
-    # Define default path if not provided
+
     if path is None:
         path = ['G', 'X', 'M', 'G', 'R', 'X']
-    
-    # Generate k-points along the path
+
     q_points = []
+    label_indices = []
     q_labels = []
-    q_positions = [0]
-    distances = []
-    
-    current_distance = 0.0
-    previous_point = None
-    
-    for i, label in enumerate(path):
-        if label not in symm_points:
-            raise ValueError(f"Unknown high symmetry point: {label}")
-        
-        point = symm_points[label]
+
+    for i, label in enumerate(path[:-1]):
+        start = np.array(symm_points[label])
+        end = np.array(symm_points[path[i + 1]])
+
+        segment = [start + (end - start) * j / n_points for j in range(n_points)]
+        q_points.extend(segment)
+
+        if i == 0:
+            label_indices.append(0)
+        else:
+            label_indices.append(len(q_points) - n_points)
+
         q_labels.append(label)
-        
-        if i < len(path) - 1:
-            next_label = path[i+1]
-            next_point = symm_points[next_label]
-            
-            # Generate points along this segment
-            for j in range(n_points if i < len(path) - 2 else n_points + 1):
-                t = j / n_points
-                k_point = (1-t) * point + t * next_point
-                q_points.append(k_point)
-                
-                # Calculate distance for the x-axis
-                if previous_point is not None:
-                    segment_length = np.linalg.norm(k_point - previous_point)
-                    current_distance += segment_length
-                
-                distances.append(current_distance)
-                previous_point = k_point
-            
-            q_positions.append(current_distance)
-    
-    # Convert lists to arrays
+
+    # Add the final point and its label
+    q_points.append(np.array(symm_points[path[-1]]))
+    label_indices.append(len(q_points) - 1)
+    q_labels.append(path[-1])
+
     q_points = np.array(q_points)
+
+    # Compute distances between q-points
+    distances = [0.0]
+    for i in range(1, len(q_points)):
+        dq = np.linalg.norm(q_points[i] - q_points[i - 1])
+        distances.append(distances[-1] + dq)
     distances = np.array(distances)
+
+    q_positions = distances[label_indices]
     
-    # Extract Hessian data
+    # Extract Hessians
     if 'mass_weighted_gamma' in hessian_data and 'mass_weighted_extended' in hessian_data:
         gamma_hessian = hessian_data['mass_weighted_gamma']
         extended_hessian = hessian_data['mass_weighted_extended']
+        print("Using mass-weighted Hessians.")
     else:
-        gamma_hessian = hessian_data['hessian']
+        gamma_hessian = hessian_data['gamma_hessian']
         extended_hessian = hessian_data['extended_hessian']
-        # Would need to mass-weight here if not already done
-    
-    # Calculate frequencies along the path
+        print("Using raw Hessians, mass-weighting will be applied.")
+        masses = []
+        for site in structure:
+            mass = site.specie.atomic_mass * AMU
+            masses.extend([mass, mass, mass])
+        masses = np.array(masses)
+        mass_matrix = np.outer(1.0 / np.sqrt(masses), 1.0 / np.sqrt(masses))
+        gamma_hessian = gamma_hessian * mass_matrix
+        extended_hessian = {k: hess * mass_matrix for k, hess in extended_hessian.items()}
+
+    # Compute frequencies
     frequencies = compute_phonon_dispersion(gamma_hessian, extended_hessian, q_points)
-    
-    # If requested, project out acoustic modes
+
+    # Remove acoustic modes at Gamma
     if remove_acoustic and frequencies.shape[1] > 3:
-        # Set the first 3 modes to zero at Gamma point
         gamma_idx = np.where(np.all(q_points == symm_points['G'], axis=1))[0]
-        if len(gamma_idx) > 0:
-            for idx in gamma_idx:
-                frequencies[idx, :3] = 0.0
-    
+        for idx in gamma_idx:
+            frequencies[idx, :3] = 0.0
+
     return {
         'q_points': q_points,
         'distances': distances,
         'frequencies': frequencies,
         'q_labels': q_labels,
-        'q_positions': q_positions
+        'q_positions': q_positions,
+        'label_indices': label_indices
     }
+
 
 def calculate_phonon_dos(hessian_data, structure, mesh=(10, 10, 10), 
                         energy_range=(0, 300), energy_step=1.0, remove_acoustic=True):
@@ -360,8 +346,8 @@ def compute_phonon_dispersion(gamma_hessian: np.ndarray,
     
     # Loop over k-points
     for ik, k in enumerate(kpoints):
-        # Start with gamma point Hessian
-        dynamical_matrix = gamma_hessian.copy().astype(np.complex128)
+        # Start with empty dynamical matrix
+        dynamical_matrix = np.zeros_like(gamma_hessian, dtype=np.complex128)
         
         # Add contributions from extended Hessian with phase factors
         for shift, hessian in extended_hessian.items():
@@ -550,8 +536,51 @@ def load_hessian(hessian_file: str) -> Tuple[np.ndarray, Dict[Tuple[int, int, in
     print(f"Loaded Hessian matrices: gamma point and {len(extended_hessian)} extended shifts")
     return gamma_hessian, extended_hessian
 
+def plot_phonon_dispersion(q_points, frequencies, labels, label_indices, output_file='phonon_dispersion.png'):
+    """
+    Plot phonon dispersion curves accurately reflecting q-point distances.
+    
+    Parameters:
+        q_points: Array-like of shape (N, 3), q-point coordinates in reciprocal space.
+        frequencies: Array of shape (N, n_branches), frequencies at each q-point.
+        labels: List of high-symmetry point labels (e.g., ["Γ", "X", "M", "Γ", "R", "X"]).
+        label_indices: Indices in q_points corresponding to high-symmetry points.
+        output_file: File to save the plot.
+    """
+    # Compute distances between consecutive q-points
+    distances = [0]
+    for i in range(1, len(q_points)):
+        dq = np.linalg.norm(q_points[i] - q_points[i-1])
+        distances.append(distances[-1] + dq)
+    distances = np.array(distances)
 
-def plot_phonon_dispersion(q_points, frequencies, labels, label_positions, output_file='phonon_dispersion.png'):
+    # Extract label positions
+    label_positions = distances[label_indices]
+
+    # Plot phonon dispersion curves
+    plt.figure(figsize=(10, 6))
+
+    for branch in range(frequencies.shape[1]):
+        plt.plot(distances, frequencies[:, branch], 'b-')
+
+    # Plot vertical lines for high-symmetry points
+    for pos in label_positions:
+        plt.axvline(x=pos, color='k', linestyle='--', alpha=0.3)
+
+    plt.xticks(label_positions, labels)
+    plt.ylim(0, 150)  # Adjust y-limits based on frequencies
+    plt.ylabel('Frequency (cm$^{-1}$)')
+    plt.xlabel('Wave vector path')
+    plt.title('Phonon Dispersion')
+    plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300)
+    plt.close()
+
+    print(f"Phonon dispersion plot saved to {output_file}")
+
+def plot_phonon_dispersion2(q_points, frequencies, labels, label_positions, output_file='phonon_dispersion.png'):
     """
     Plot phonon dispersion curves
     
@@ -642,7 +671,7 @@ def compute_and_plot_phonons(hessian_file, nk_mesh=10, n_path_points=50,
     gamma_hessian = results.get('mass_weighted_gamma')
     print(gamma_hessian)
     #gamma_hessian = results.get('mass_weighted_gamma', results['gamma_hessian'])
-    extended_hessian = results.get('mass_weighted_extended', results['extended_hessian'])
+    extended_hessian = results.get('mass_weighted_extended')
     
     #write_extended_hessian_txt(results['extended_hessian'], "extended_hessian.txt")
 
@@ -675,6 +704,8 @@ def compute_and_plot_phonons(hessian_file, nk_mesh=10, n_path_points=50,
     dos_file = os.path.join(output_dir, 'phonon_dos.png')
     plot_dos(freq_bins, dos, dos_file)
     
+    calculate_gamma_phonons(gamma_hessian)
+
     # Save frequency data
     np.savez(os.path.join(output_dir, 'phonon_data.npz'),
              path_kpoints=k_path,
@@ -753,7 +784,7 @@ def plot_combined_dispersion_and_dos(path_frequencies, freq_bins, dos,
 
 if __name__ == "__main__":
     import argparse
-    from OLDextended_hessian import compute_hessian_at_structure, save_hessian_all_in_one, load_hessian_all_in_one
+    from extended_hessian import compute_hessian_at_structure, save_hessian_all_in_one, load_hessian_all_in_one
     from pymatgen.core import Structure
     
     parser = argparse.ArgumentParser(description="Compute and plot phonon properties")
@@ -791,6 +822,7 @@ if __name__ == "__main__":
         # Save the Hessian
         save_hessian_all_in_one(results, hessian_file.replace('.npz', ''))
     else:
+        
         print(f"Using provided Hessian file: {hessian_file}")
     
     if not os.path.exists(hessian_file):
